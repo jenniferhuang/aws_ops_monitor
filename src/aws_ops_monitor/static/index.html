@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <meta name="description" content="Private AWS host and Xray operations dashboard">
+    <title>AWS Ops Monitor</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to dashboard</a>
+    <div class="shell">
+      <header class="topbar">
+        <div class="brand" aria-label="AWS Ops Monitor">
+          <span class="brand-mark" aria-hidden="true">AO</span>
+          <span>
+            <strong>AWS Ops Monitor</strong>
+            <small>Private operations plane</small>
+          </span>
+        </div>
+        <div class="topbar-meta">
+          <span class="privacy"><span class="privacy-dot" aria-hidden="true"></span>Loopback only</span>
+          <span id="updated" class="updated">Waiting for collector</span>
+        </div>
+      </header>
+
+      <main id="main">
+        <section class="hero" aria-labelledby="health-title">
+          <div>
+            <p class="eyebrow">LIGHTSAIL · XRAY · HOST</p>
+            <h1 id="health-title">Traffic, paths, and host health</h1>
+            <p class="lede">Each layer is measured independently so overlapping counters are never presented as one billable total.</p>
+          </div>
+          <div id="overall-status" class="status-pill status-unknown" role="status" aria-live="polite">
+            <span class="status-light" aria-hidden="true"></span>
+            <span>Unknown</span>
+          </div>
+        </section>
+
+        <div id="notice" class="notice" role="alert" hidden></div>
+
+        <section class="metric-grid" aria-label="Current metrics">
+          <article class="metric-card">
+            <div class="metric-heading">
+              <span class="metric-icon inbound" aria-hidden="true">↓</span>
+              <span>Host inbound</span>
+            </div>
+            <strong id="host-rx" class="metric-value">—</strong>
+            <small id="host-rx-note">Interface delta in selected window</small>
+          </article>
+          <article class="metric-card">
+            <div class="metric-heading">
+              <span class="metric-icon outbound" aria-hidden="true">↑</span>
+              <span>Host outbound</span>
+            </div>
+            <strong id="host-tx" class="metric-value">—</strong>
+            <small id="host-tx-note">Interface delta in selected window</small>
+          </article>
+          <article class="metric-card">
+            <div class="metric-heading">
+              <span class="metric-icon vpn" aria-hidden="true">↕</span>
+              <span>Xray traffic</span>
+            </div>
+            <strong id="xray-total" class="metric-value">—</strong>
+            <small id="xray-note">Application counters; not added to host traffic</small>
+          </article>
+          <article class="metric-card">
+            <div class="metric-heading">
+              <span class="metric-icon allowance" aria-hidden="true">◎</span>
+              <span>Transfer allowance</span>
+            </div>
+            <strong id="allowance" class="metric-value">Unavailable</strong>
+            <small id="allowance-note">Requires AWS read-only metrics permission</small>
+          </article>
+        </section>
+
+        <section class="panel chart-panel" aria-labelledby="traffic-title">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">LAYERED COUNTERS</p>
+              <h2 id="traffic-title">Transfer history</h2>
+            </div>
+            <div class="range-picker" aria-label="Chart range">
+              <button type="button" data-hours="1">1h</button>
+              <button type="button" data-hours="24" class="active" aria-pressed="true">24h</button>
+              <button type="button" data-hours="168">7d</button>
+              <button type="button" data-hours="720">30d</button>
+            </div>
+          </div>
+          <div class="legend" aria-label="Chart legend">
+            <span><i class="legend-host-in"></i>Host inbound</span>
+            <span><i class="legend-host-out"></i>Host outbound</span>
+            <span><i class="legend-xray"></i>Xray combined</span>
+          </div>
+          <div class="chart-wrap">
+            <canvas id="traffic-chart" height="240" aria-label="Traffic over time" role="img"></canvas>
+            <p id="chart-empty" class="empty-state">Waiting for historical samples.</p>
+          </div>
+        </section>
+
+        <div class="two-column">
+          <section class="panel" aria-labelledby="paths-title">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">NETWORK RELATIONSHIP</p>
+                <h2 id="paths-title">Access paths</h2>
+              </div>
+            </div>
+            <div id="paths" class="path-list">
+              <p class="empty-state">Waiting for path checks.</p>
+            </div>
+            <p class="panel-footnote">Labels are privacy-safe; raw client addresses and credentials are never returned by this site.</p>
+          </section>
+
+          <section class="panel" aria-labelledby="resources-title">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">INSTANCE</p>
+                <h2 id="resources-title">Host resources</h2>
+              </div>
+            </div>
+            <div class="resource-list">
+              <div class="resource">
+                <div><span>Memory</span><strong id="memory-label">—</strong></div>
+                <progress id="memory-bar" max="100" value="0">0%</progress>
+              </div>
+              <div class="resource">
+                <div><span>Root disk</span><strong id="disk-label">—</strong></div>
+                <progress id="disk-bar" max="100" value="0">0%</progress>
+              </div>
+              <div class="resource">
+                <div><span>Load (1m)</span><strong id="load-label">—</strong></div>
+                <progress id="load-bar" max="100" value="0">0%</progress>
+              </div>
+            </div>
+            <dl class="facts">
+              <div><dt>Uptime</dt><dd id="uptime">—</dd></div>
+              <div><dt>Xray</dt><dd id="xray-health">Unknown</dd></div>
+              <div><dt>Restart count</dt><dd id="xray-restarts">—</dd></div>
+              <div><dt>Collector age</dt><dd id="collector-age">—</dd></div>
+            </dl>
+          </section>
+        </div>
+
+        <section class="panel" aria-labelledby="alerts-title">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">REQUIRES ATTENTION</p>
+              <h2 id="alerts-title">Alerts and limits</h2>
+            </div>
+            <span id="alert-count" class="count-badge">0</span>
+          </div>
+          <div id="alerts" class="alert-list">
+            <p class="empty-state">No alert snapshot is available yet.</p>
+          </div>
+        </section>
+      </main>
+
+      <footer>
+        <span>AWS Ops Monitor</span>
+        <span>Read-only · no Docker socket · no public listener</span>
+      </footer>
+    </div>
+    <noscript>This dashboard needs local JavaScript to render monitoring data.</noscript>
+  </body>
+</html>

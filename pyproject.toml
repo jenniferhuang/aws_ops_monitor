@@ -11,6 +11,7 @@ dependencies = []
 
 [project.scripts]
 aws-ops-monitor = "aws_ops_monitor.__main__:main"
+aws-ops-monitor-web = "aws_ops_monitor.web:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
