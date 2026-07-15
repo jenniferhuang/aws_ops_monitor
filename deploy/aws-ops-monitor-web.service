@@ -1,0 +1,49 @@
+[Unit]
+Description=AWS Ops Monitor private dashboard
+Documentation=https://github.com/jenniferhuang/aws_ops_monitor
+After=aws-ops-monitor-collector.service
+Requires=aws-ops-monitor-collector.service
+
+[Service]
+Type=simple
+User=awsops-web
+Group=awsops-web
+SupplementaryGroups=awsops-data
+EnvironmentFile=/etc/aws-ops-monitor/web.env
+Environment=PYTHONPATH=/opt/aws-ops-monitor/current/src
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -m aws_ops_monitor.web
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15s
+UMask=0027
+MemoryHigh=64M
+MemoryMax=128M
+TasksMax=32
+
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadOnlyPaths=/var/lib/aws-ops-monitor /etc/aws-ops-monitor/web-password
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+IPAddressDeny=any
+IPAddressAllow=localhost
+
+[Install]
+WantedBy=multi-user.target

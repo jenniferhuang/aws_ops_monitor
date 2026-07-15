@@ -1,0 +1,49 @@
+[Unit]
+Description=AWS Ops Monitor collector
+Documentation=https://github.com/jenniferhuang/aws_ops_monitor
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=awsops-collector
+Group=awsops-collector
+SupplementaryGroups=awsops-data docker
+EnvironmentFile=/etc/aws-ops-monitor/collector.env
+Environment=PYTHONPATH=/opt/aws-ops-monitor/current/src
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -m aws_ops_monitor
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=20s
+UMask=0027
+MemoryHigh=128M
+MemoryMax=192M
+TasksMax=64
+
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadOnlyPaths=/etc/aws-ops-monitor/xray-user-hash.key
+ReadWritePaths=/var/lib/aws-ops-monitor
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
