@@ -140,6 +140,10 @@ else
   install -d -o root -g root -m 0755 "$stage_dir"
   tar -C "$source_dir" --exclude=.git --exclude=backups --exclude=releases -cf - . \
     | tar -C "$stage_dir" -xf -
+  # A tar stream containing '.' can replace the destination directory mode
+  # with the source root mode.  Keep every final release traversable by the
+  # unprivileged collector and web users even when the upload stage was 0700.
+  chmod 0755 "$stage_dir"
   RELEASE_SOURCE="$stage_dir/src" python3 - <<'PY'
 import os
 from pathlib import Path

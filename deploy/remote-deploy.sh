@@ -121,6 +121,11 @@ install -d -m 0700 "$stage"
 # longer matches the root-owned 0644/0755 release installed below.
 umask 022
 tar --no-same-owner --no-same-permissions -C "$stage" -xzf "$archive"
+# The staging directory starts private while the archive is in transit.  The
+# installed services run as unprivileged users, so the release root itself
+# must become traversable before its mode-independent root is copied into
+# /opt/aws-ops-monitor/releases.
+chmod 0755 "$stage"
 rm -f -- "$archive"
 tree_sha256=$(python3 "$stage/deploy/tree-hash.py" "$stage")
 sudo "$stage/deploy/transaction.sh" \
