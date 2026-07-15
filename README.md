@@ -106,8 +106,9 @@ boundary.
 Host and Xray telemetry can run without AWS account credentials. Authoritative
 Lightsail firewall, instance plan allocation, `NetworkIn`/`NetworkOut`, and
 alarms require a least-privilege identity for the correct AWS account. Until
-then, consumption is labeled **host-measured estimate**. The site does not
-claim to show an AWS bill.
+then, the AWS usage panel remains unavailable; whole-host NIC counters stay in
+their separate, explicitly host-measured layer and are not substituted for AWS
+data. The site does not claim to show an AWS bill.
 
 Lightsail transfer usage is pooled across same-bundle instances in a region.
 Therefore the site shows one instance's month-to-date `NetworkIn + NetworkOut`
