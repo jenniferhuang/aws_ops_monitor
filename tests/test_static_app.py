@@ -8,9 +8,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 APP = ROOT / "src" / "aws_ops_monitor" / "static" / "app.js"
+INDEX = ROOT / "src" / "aws_ops_monitor" / "static" / "index.html"
 
 
 class StaticDashboardJavaScriptTests(unittest.TestCase):
+    def test_index_uses_inline_favicon_without_an_authenticated_asset_request(self) -> None:
+        html = INDEX.read_text(encoding="utf-8")
+        self.assertIn('<link rel="icon" href="data:image/svg+xml,', html)
+
     def test_missing_values_and_progress_labels_are_not_coerced_to_zero(self) -> None:
         node = shutil.which("node")
         if node is None:
