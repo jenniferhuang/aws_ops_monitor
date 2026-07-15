@@ -9,6 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "deploy" / "tree-hash.py"
+REMOTE_DEPLOY = ROOT / "deploy" / "remote-deploy.sh"
 
 
 def calculate(directory: Path) -> subprocess.CompletedProcess[str]:
@@ -21,6 +22,14 @@ def calculate(directory: Path) -> subprocess.CompletedProcess[str]:
 
 
 class TreeHashTests(unittest.TestCase):
+    def test_remote_extraction_normalizes_permissions_before_tree_hash(self) -> None:
+        script = REMOTE_DEPLOY.read_text(encoding="utf-8")
+        normalization = """umask 022
+tar --no-same-owner --no-same-permissions -C \"$stage\" -xzf \"$archive\"
+rm -f -- \"$archive\"
+tree_sha256=$(python3 \"$stage/deploy/tree-hash.py\" \"$stage\")"""
+        self.assertIn(normalization, script)
+
     def test_hash_is_deterministic_and_ignores_release_markers(self) -> None:
         with tempfile.TemporaryDirectory() as raw_directory:
             directory = Path(raw_directory)

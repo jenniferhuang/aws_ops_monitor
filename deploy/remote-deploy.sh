@@ -115,7 +115,12 @@ actual_sha=$(sha256sum "$archive" | awk '{print $1}')
 [[ $actual_sha == "$expected_sha" ]]
 rm -rf -- "$stage"
 install -d -m 0700 "$stage"
-tar -C "$stage" -xzf "$archive"
+# Git archives commonly encode regular files as 0664 and executables as 0775.
+# Normalize through a fixed umask before computing the mode-sensitive tree
+# hash; otherwise the SSH user's login umask can produce an artifact that no
+# longer matches the root-owned 0644/0755 release installed below.
+umask 022
+tar --no-same-owner --no-same-permissions -C "$stage" -xzf "$archive"
 rm -f -- "$archive"
 tree_sha256=$(python3 "$stage/deploy/tree-hash.py" "$stage")
 sudo "$stage/deploy/transaction.sh" \
