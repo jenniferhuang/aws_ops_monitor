@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aws-ops-monitor"
+version = "0.1.0"
+description = "Private, read-only AWS Lightsail and Xray host telemetry collector"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+aws-ops-monitor = "aws_ops_monitor.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+aws_ops_monitor = ["static/*"]
