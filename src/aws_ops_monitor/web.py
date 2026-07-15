@@ -21,6 +21,7 @@ import re
 import sqlite3
 import socket
 import time
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
@@ -29,6 +30,18 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 from urllib.parse import parse_qs, quote, urlsplit
+
+from .store import (
+    _NETWORK_COUNTER_FIELDS,
+    _attested_aws_gauge,
+    _aws_service_projection,
+    _cpu_utilization_percent,
+    _is_current_aws_snapshot,
+    _is_external_interface,
+    _is_required_verified_path,
+    _is_safe_xray_user_hash,
+    _required_path_effective_state,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -123,12 +136,14 @@ class ReadOnlySQLiteRepository:
         self.path = Path(path).expanduser()
 
     def overview(self) -> Mapping[str, Any]:
-        with self._connect() as connection:
+        now = time.time()
+        with closing(self._connect()) as connection:
             gauges = self._latest_gauges(connection)
             health = self._latest_health(connection)
-            host_window = self._host_window(connection, time.time() - 86400)
+            host_window = self._host_window(connection, now - 86400)
             host_totals = self._host_totals(connection)
             xray_totals = self._xray_totals(connection)
+            cpu_utilization = self._cpu_utilization(connection)
 
         latest_time = max(
             [row["observed_at"] for row in health.values()]
@@ -136,7 +151,7 @@ class ReadOnlySQLiteRepository:
             + [0.0]
         )
         alerts: list[dict[str, object]] = []
-        overall = _overall_health(health)
+        overall = _overall_health(health, now=now)
         if latest_time <= 0:
             overall = "unknown"
             alerts.append(
@@ -146,7 +161,7 @@ class ReadOnlySQLiteRepository:
                     "message": "The collector has not written a readable snapshot.",
                 }
             )
-        elif time.time() - latest_time > 300:
+        elif now - latest_time > 300:
             overall = "critical"
             alerts.append(
                 {
@@ -156,7 +171,55 @@ class ReadOnlySQLiteRepository:
                     "timestamp": latest_time,
                 }
             )
+        network_health = health.get("network_exposure", {})
+        network_details = network_health.get("details", {})
+        unexpected_public = (
+            str(network_details.get("unexpected_public_ports", ""))
+            if isinstance(network_details, Mapping)
+            else ""
+        )
+        if unexpected_public:
+            overall = "critical"
+            alerts.append(
+                {
+                    "severity": "critical",
+                    "title": "Unexpected public listener",
+                    "message": f"Unexpected public ports: {unexpected_public}.",
+                    "timestamp": network_health.get("observed_at"),
+                }
+            )
         for component, item in health.items():
+            if component.startswith("path_"):
+                details = item.get("details", {})
+                effective_state, stale = _required_path_effective_state(
+                    dict(item), now=now
+                )
+                if _is_required_verified_path(dict(item)) and effective_state not in {
+                    "healthy",
+                    "disabled",
+                }:
+                    alerts.append(
+                        {
+                            "severity": (
+                                "critical"
+                                if effective_state == "unavailable"
+                                else "warning"
+                            ),
+                            "title": f"{details.get('name', 'Required path')} failed",
+                            "message": (
+                                "Required synthetic path evidence is stale."
+                                if stale
+                                else item["message"]
+                            ),
+                            "timestamp": item["observed_at"],
+                        }
+                    )
+                continue
+            if (
+                component == "network_exposure" and unexpected_public
+                or item["state"] in {"healthy", "disabled"}
+            ):
+                continue
             if item["state"] != "healthy":
                 severity = "critical" if item["state"] == "unavailable" else "warning"
                 alerts.append(
@@ -167,12 +230,31 @@ class ReadOnlySQLiteRepository:
                         "timestamp": item["observed_at"],
                     }
                 )
-        if "aws" not in health:
+        if "aws" not in health or health.get("aws", {}).get("state") == "disabled":
             alerts.append(
                 {
                     "severity": "info",
                     "title": "AWS control-plane metrics unavailable",
                     "message": "Host traffic is an estimate until least-privilege AWS read access is configured.",
+                }
+            )
+
+        fault_delta = sum(
+            host_window[field]
+            for field in ("rx_errors", "rx_drops", "tx_errors", "tx_drops")
+        )
+        if fault_delta:
+            if overall == "healthy":
+                overall = "degraded"
+            alerts.append(
+                {
+                    "severity": "warning",
+                    "title": "Network interface faults increased",
+                    "message": (
+                        "External-interface errors/drops increased by "
+                        f"{fault_delta} in the last 24 hours."
+                    ),
+                    "timestamp": latest_time,
                 }
             )
 
@@ -183,6 +265,8 @@ class ReadOnlySQLiteRepository:
         host: dict[str, object] = {
             "uptime_seconds": _gauge_value(gauges, "host", "uptime_seconds"),
             "load_1m": _gauge_value(gauges, "host", "load_1m"),
+            "cpu_count": _gauge_value(gauges, "host", "cpu_count"),
+            "cpu_utilization_percent": cpu_utilization,
             "memory": {
                 "total_bytes": memory_total,
                 "used_bytes": _used_bytes(memory_total, memory_available),
@@ -193,54 +277,130 @@ class ReadOnlySQLiteRepository:
             },
         }
         xray_health = health.get("xray", {})
+        xray_details = xray_health.get("details", {})
+        aws_health = health.get("aws", {})
+        aws_details = aws_health.get("details", {})
+        aws_gauges = {
+            name: sample
+            for (source, name), sample in gauges.items()
+            if source == "aws"
+        }
+        aws_traffic: dict[str, object] = {}
+        if _is_current_aws_snapshot(
+            dict(aws_health) if isinstance(aws_health, Mapping) else None,
+            aws_gauges,
+            now=now,
+        ):
+            for metric, field in (
+                ("network_in_month_bytes", "network_in_month_bytes"),
+                ("network_out_month_bytes", "network_out_month_bytes"),
+                ("transfer_used_month_bytes", "transfer_used_bytes"),
+            ):
+                sample = _attested_aws_gauge(
+                    dict(aws_health) if isinstance(aws_health, Mapping) else None,
+                    aws_gauges.get(metric),
+                )
+                if sample is not None:
+                    aws_traffic[field] = int(sample[1])
+            if any(
+                field in aws_traffic
+                for field in (
+                    "network_in_month_bytes",
+                    "network_out_month_bytes",
+                    "transfer_used_bytes",
+                )
+            ):
+                aws_traffic["usage_source"] = "lightsail_read_only"
+            plan_allocation_provenance = (
+                str(
+                    aws_details.get("plan_allocation_provenance")
+                    or aws_details.get("allowance_provenance")
+                )
+                if isinstance(aws_details, Mapping)
+                and (
+                    aws_details.get("plan_allocation_provenance")
+                    or aws_details.get("allowance_provenance")
+                )
+                else None
+            )
+            plan_allocation = _attested_aws_gauge(
+                dict(aws_health) if isinstance(aws_health, Mapping) else None,
+                aws_gauges.get("transfer_plan_allocation_bytes")
+                or aws_gauges.get("transfer_allowance_bytes"),
+            )
+            if plan_allocation is not None and plan_allocation_provenance:
+                aws_traffic["plan_allocation_bytes"] = int(plan_allocation[1])
+                aws_traffic["plan_allocation_source"] = plan_allocation_provenance
+        paths = _path_projection(health, now=now)
+        host_traffic: dict[str, object] = {
+            f"{field}_window": value for field, value in host_window.items()
+        }
+        host_traffic.update(
+            {f"{field}_total": value for field, value in host_totals.items()}
+        )
+        xray_traffic: dict[str, object] = {
+            "uplink_bytes": xray_totals["uplink"],
+            "downlink_bytes": xray_totals["downlink"],
+        }
+        users = xray_totals.get("users")
+        if isinstance(users, list) and users:
+            xray_traffic["users"] = users
+        traffic: dict[str, object] = {
+            "host": host_traffic,
+            "xray": xray_traffic,
+        }
+        if aws_traffic:
+            traffic["aws"] = aws_traffic
+
+        services: dict[str, object] = {
+            "xray": {
+                "status": xray_health.get("state", "unknown"),
+                "container_status": xray_details.get("container_status")
+                if isinstance(xray_details, Mapping)
+                else None,
+                "restart_count": xray_details.get("restart_count")
+                if isinstance(xray_details, Mapping)
+                else None,
+                "oom_killed": xray_details.get("oom_killed")
+                if isinstance(xray_details, Mapping)
+                else None,
+            }
+        }
+        if isinstance(aws_health, Mapping) and aws_health:
+            services["aws"] = _aws_service_projection(dict(aws_health))
+
         return {
             "status": overall,
             "collected_at": latest_time or None,
             "host": host,
-            "traffic": {
-                "host": {
-                    "rx_bytes_window": host_window["rx"],
-                    "tx_bytes_window": host_window["tx"],
-                    "rx_bytes_total": host_totals["rx"],
-                    "tx_bytes_total": host_totals["tx"],
-                },
-                "xray": {
-                    "uplink_bytes": xray_totals["uplink"],
-                    "downlink_bytes": xray_totals["downlink"],
-                },
-                "aws": {"source": "unavailable"},
-            },
-            "services": {
-                "xray": {
-                    "status": xray_health.get("state", "unknown"),
-                }
-            },
-            "paths": [],
+            "traffic": traffic,
+            "services": services,
+            "paths": paths,
             "alerts": alerts,
         }
 
     def series(self, *, since_unix: int, limit: int) -> Sequence[Mapping[str, Any]]:
         now = int(time.time())
         bucket_seconds = max(1, math.ceil(max(1, now - since_unix) / limit))
-        with self._connect() as connection:
+        with closing(self._connect()) as connection:
             host_rows = connection.execute(
                 """
-                SELECT CAST((observed_at - ?) / ? AS INTEGER) AS bucket,
-                       MIN(observed_at) AS observed_at,
-                       SUM(CASE WHEN name = 'network_receive_bytes_total'
-                                THEN delta_value ELSE 0 END) AS rx,
-                       SUM(CASE WHEN name = 'network_transmit_bytes_total'
-                                THEN delta_value ELSE 0 END) AS tx
-                FROM counter_samples
+                SELECT observed_at, name, labels_json, delta_value
+                FROM (
+                    SELECT observed_at, source, name, labels_json, delta_value
+                    FROM counter_samples
+                    WHERE observed_at >= ?
+                    UNION ALL
+                    SELECT bucket_start AS observed_at,
+                           source, name, labels_json, delta_value
+                    FROM counter_hourly_rollups
+                    WHERE bucket_start >= CAST(? / 3600 AS INTEGER) * 3600
+                )
                 WHERE source = 'host'
                   AND name IN ('network_receive_bytes_total', 'network_transmit_bytes_total')
-                  AND observed_at >= ?
-                  AND COALESCE(json_extract(labels_json, '$.interface'), '') != 'lo'
-                GROUP BY bucket
-                ORDER BY bucket ASC
-                LIMIT ?
+                ORDER BY observed_at ASC
                 """,
-                (since_unix, bucket_seconds, since_unix, limit),
+                (since_unix, since_unix),
             ).fetchall()
             xray_scope = self._preferred_xray_scope(connection)
             xray_rows: list[sqlite3.Row] = []
@@ -253,28 +413,60 @@ class ReadOnlySQLiteRepository:
                                     THEN delta_value ELSE 0 END) AS uplink,
                            SUM(CASE WHEN json_extract(labels_json, '$.direction') = 'downlink'
                                     THEN delta_value ELSE 0 END) AS downlink
-                    FROM counter_samples
+                    FROM (
+                        SELECT observed_at, source, name, labels_json, delta_value
+                        FROM counter_samples
+                        WHERE observed_at >= ?
+                        UNION ALL
+                        SELECT bucket_start AS observed_at,
+                               source, name, labels_json, delta_value
+                        FROM counter_hourly_rollups
+                        WHERE bucket_start >= CAST(? / 3600 AS INTEGER) * 3600
+                    )
                     WHERE source = 'xray'
                       AND name = 'traffic_bytes_total'
-                      AND observed_at >= ?
                       AND json_extract(labels_json, '$.scope') = ?
                     GROUP BY bucket
                     ORDER BY bucket ASC
                     LIMIT ?
                     """,
-                    (since_unix, bucket_seconds, since_unix, xray_scope, limit),
+                    (
+                        since_unix,
+                        bucket_seconds,
+                        since_unix,
+                        since_unix,
+                        xray_scope,
+                        limit,
+                    ),
                 ).fetchall()
 
         points: dict[int, dict[str, object]] = {}
         for row in host_rows:
-            bucket = int(row["bucket"])
-            points[bucket] = {
-                "timestamp": float(row["observed_at"]),
-                "host_rx_bytes": int(row["rx"] or 0),
-                "host_tx_bytes": int(row["tx"] or 0),
-                "xray_up_bytes": 0,
-                "xray_down_bytes": 0,
-            }
+            try:
+                labels = json.loads(str(row["labels_json"]))
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(labels, dict) or not _is_external_interface(labels):
+                continue
+            observed_at = float(row["observed_at"])
+            bucket = int((observed_at - since_unix) // bucket_seconds)
+            point = points.setdefault(
+                bucket,
+                {
+                    "timestamp": observed_at,
+                    "host_rx_bytes": 0,
+                    "host_tx_bytes": 0,
+                    "xray_up_bytes": 0,
+                    "xray_down_bytes": 0,
+                },
+            )
+            point["timestamp"] = min(float(point["timestamp"]), observed_at)
+            field = (
+                "host_rx_bytes"
+                if str(row["name"]) == "network_receive_bytes_total"
+                else "host_tx_bytes"
+            )
+            point[field] = int(point[field]) + int(row["delta_value"])
         for row in xray_rows:
             bucket = int(row["bucket"])
             point = points.setdefault(
@@ -290,12 +482,13 @@ class ReadOnlySQLiteRepository:
             point["timestamp"] = min(float(point["timestamp"]), float(row["observed_at"]))
             point["xray_up_bytes"] = int(row["uplink"] or 0)
             point["xray_down_bytes"] = int(row["downlink"] or 0)
-        return [points[bucket] for bucket in sorted(points)][:limit]
+        return [points[bucket] for bucket in sorted(points)][-limit:]
 
     def _connect(self) -> sqlite3.Connection:
         if not self.path.is_file() or self.path.is_symlink():
             raise RepositoryUnavailable("monitor database is unavailable")
         uri = f"file:{quote(str(self.path.resolve()), safe='/')}?mode=ro"
+        connection: sqlite3.Connection | None = None
         try:
             connection = sqlite3.connect(uri, uri=True, timeout=2.0)
             connection.row_factory = sqlite3.Row
@@ -304,6 +497,8 @@ class ReadOnlySQLiteRepository:
             connection.execute("PRAGMA busy_timeout = 2000")
             return connection
         except sqlite3.Error as error:
+            if connection is not None:
+                connection.close()
             raise RepositoryUnavailable("monitor database is unavailable") from error
 
     @staticmethod
@@ -331,7 +526,8 @@ class ReadOnlySQLiteRepository:
     def _latest_health(connection: sqlite3.Connection) -> dict[str, dict[str, object]]:
         rows = connection.execute(
             """
-            SELECT sample.observed_at, sample.component, sample.state, sample.message
+            SELECT sample.observed_at, sample.component, sample.state,
+                   sample.message, sample.details_json
             FROM health_samples AS sample
             JOIN (
                 SELECT component, MAX(id) AS id
@@ -340,57 +536,79 @@ class ReadOnlySQLiteRepository:
             ) AS latest ON latest.id = sample.id
             """
         ).fetchall()
-        return {
-            str(row["component"]): {
+        result: dict[str, dict[str, object]] = {}
+        for row in rows:
+            try:
+                details = json.loads(str(row["details_json"]))
+            except (json.JSONDecodeError, TypeError):
+                details = {}
+            if not isinstance(details, Mapping):
+                details = {}
+            result[str(row["component"])] = {
                 "observed_at": float(row["observed_at"]),
                 "state": str(row["state"]),
                 "message": str(row["message"]),
+                "details": dict(details),
             }
-            for row in rows
-        }
+        return result
 
     @staticmethod
     def _host_window(connection: sqlite3.Connection, since: float) -> dict[str, int]:
+        names = tuple(_NETWORK_COUNTER_FIELDS)
+        placeholders = ",".join("?" for _ in names)
         rows = connection.execute(
-            """
-            SELECT name, SUM(delta_value) AS value
+            f"""
+            SELECT name, labels_json, delta_value
             FROM counter_samples
             WHERE source = 'host'
-              AND name IN ('network_receive_bytes_total', 'network_transmit_bytes_total')
+              AND name IN ({placeholders})
               AND observed_at >= ?
-              AND COALESCE(json_extract(labels_json, '$.interface'), '') != 'lo'
-            GROUP BY name
-            """,
-            (since,),
+            """,  # noqa: S608 - placeholders are generated, not caller controlled
+            (*names, since),
         ).fetchall()
-        values = {str(row["name"]): int(row["value"] or 0) for row in rows}
-        return {
-            "rx": values.get("network_receive_bytes_total", 0),
-            "tx": values.get("network_transmit_bytes_total", 0),
-        }
+        values = {field: 0 for field in _NETWORK_COUNTER_FIELDS.values()}
+        for row in rows:
+            try:
+                labels = json.loads(str(row["labels_json"]))
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(labels, dict) or not _is_external_interface(labels):
+                continue
+            field = _NETWORK_COUNTER_FIELDS.get(str(row["name"]))
+            if field:
+                values[field] += int(row["delta_value"])
+        return values
 
     @staticmethod
     def _host_totals(connection: sqlite3.Connection) -> dict[str, int]:
+        names = tuple(_NETWORK_COUNTER_FIELDS)
+        placeholders = ",".join("?" for _ in names)
         rows = connection.execute(
-            """
-            SELECT name, SUM(raw_value) AS value
+            f"""
+            SELECT name, labels_json, raw_value
             FROM counter_cursors
             WHERE source = 'host'
-              AND name IN ('network_receive_bytes_total', 'network_transmit_bytes_total')
-              AND COALESCE(json_extract(labels_json, '$.interface'), '') != 'lo'
-            GROUP BY name
-            """
+              AND name IN ({placeholders})
+            """,  # noqa: S608 - placeholders are generated, not caller controlled
+            names,
         ).fetchall()
-        values = {str(row["name"]): int(row["value"] or 0) for row in rows}
-        return {
-            "rx": values.get("network_receive_bytes_total", 0),
-            "tx": values.get("network_transmit_bytes_total", 0),
-        }
+        values = {field: 0 for field in _NETWORK_COUNTER_FIELDS.values()}
+        for row in rows:
+            try:
+                labels = json.loads(str(row["labels_json"]))
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(labels, dict) or not _is_external_interface(labels):
+                continue
+            field = _NETWORK_COUNTER_FIELDS.get(str(row["name"]))
+            if field:
+                values[field] += int(row["raw_value"])
+        return values
 
-    def _xray_totals(self, connection: sqlite3.Connection) -> dict[str, int]:
+    def _xray_totals(self, connection: sqlite3.Connection) -> dict[str, object]:
         scope = self._preferred_xray_scope(connection)
         if not scope:
-            return {"uplink": 0, "downlink": 0}
+            return {"uplink": 0, "downlink": 0, "users": []}
         rows = connection.execute(
             """
             SELECT json_extract(labels_json, '$.direction') AS direction,
@@ -404,7 +622,78 @@ class ReadOnlySQLiteRepository:
             (scope,),
         ).fetchall()
         values = {str(row["direction"]): int(row["value"] or 0) for row in rows}
-        return {"uplink": values.get("uplink", 0), "downlink": values.get("downlink", 0)}
+        users: list[dict[str, object]] = []
+        if scope == "user":
+            user_rows = connection.execute(
+                """
+                SELECT labels_json, raw_value
+                FROM counter_cursors
+                WHERE source = 'xray'
+                  AND name = 'traffic_bytes_total'
+                  AND json_extract(labels_json, '$.scope') = 'user'
+                """
+            ).fetchall()
+            by_user: dict[str, dict[str, int]] = {}
+            for row in user_rows:
+                try:
+                    labels = json.loads(str(row["labels_json"]))
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(labels, dict):
+                    continue
+                user_hash = labels.get("user_hash")
+                direction = str(labels.get("direction", ""))
+                if not _is_safe_xray_user_hash(user_hash) or direction not in {
+                    "uplink",
+                    "downlink",
+                }:
+                    continue
+                user = by_user.setdefault(
+                    str(user_hash), {"uplink_bytes": 0, "downlink_bytes": 0}
+                )
+                user[f"{direction}_bytes"] += int(row["raw_value"])
+            users = [
+                {"user_hash": user_hash, **by_user[user_hash]}
+                for user_hash in sorted(by_user)
+            ]
+        return {
+            "uplink": values.get("uplink", 0),
+            "downlink": values.get("downlink", 0),
+            "users": users,
+        }
+
+    @staticmethod
+    def _cpu_utilization(connection: sqlite3.Connection) -> float | None:
+        rows = connection.execute(
+            """
+            SELECT sample.name, sample.observed_at, sample.delta_value,
+                   sample.is_baseline, sample.is_reset
+            FROM counter_samples AS sample
+            JOIN (
+                SELECT name, MAX(id) AS id
+                FROM counter_samples
+                WHERE source = 'host'
+                  AND name IN ('cpu_total_jiffies', 'cpu_idle_jiffies')
+                GROUP BY name
+            ) AS latest ON latest.id = sample.id
+            """
+        ).fetchall()
+        values = {str(row["name"]): row for row in rows}
+        total = values.get("cpu_total_jiffies")
+        idle = values.get("cpu_idle_jiffies")
+        if (
+            total is None
+            or idle is None
+            or float(total["observed_at"]) != float(idle["observed_at"])
+            or bool(total["is_baseline"])
+            or bool(idle["is_baseline"])
+            or bool(total["is_reset"])
+            or bool(idle["is_reset"])
+        ):
+            return None
+        return _cpu_utilization_percent(
+            int(total["delta_value"]), int(idle["delta_value"])
+        )
 
     @staticmethod
     def _preferred_xray_scope(connection: sqlite3.Connection) -> str | None:
@@ -485,6 +774,12 @@ class MonitorHTTPServer(ThreadingHTTPServer):
         self.config = config
         self.repository = repository
         super().__init__(server_address, handler_class)
+
+    def handle_error(self, request: object, client_address: object) -> None:
+        """Keep handler failures generic and omit client addresses from logs."""
+
+        del request, client_address
+        LOGGER.warning("dashboard request handler failed", exc_info=False)
 
 
 class MonitorHTTPServerV6(MonitorHTTPServer):
@@ -687,7 +982,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         if not head_only:
-            self.wfile.write(payload)
+            try:
+                self.wfile.write(payload)
+            except (BrokenPipeError, ConnectionResetError):
+                # Browsers routinely cancel in-flight refreshes when a tab is
+                # closed or reloaded. This is not a service failure and must
+                # not fall through to socketserver's address-bearing traceback.
+                self.close_connection = True
 
     def _security_headers(self, *, authenticated: bool) -> None:
         del authenticated  # Reserved for a stricter authenticated CSP if needed.
@@ -806,10 +1107,66 @@ def _used_bytes(total: float | None, available: float | None) -> float | None:
     return max(0.0, total - available)
 
 
-def _overall_health(health: Mapping[str, Mapping[str, object]]) -> str:
-    if not health:
+def _path_projection(
+    health: Mapping[str, Mapping[str, object]],
+    *,
+    now: float,
+) -> list[dict[str, object]]:
+    paths: list[dict[str, object]] = []
+    for component, item in health.items():
+        if not component.startswith("path_"):
+            continue
+        raw_details = item.get("details", {})
+        details = raw_details if isinstance(raw_details, Mapping) else {}
+        effective_state, stale = _required_path_effective_state(dict(item), now=now)
+        route = [
+            hop.strip()
+            for hop in str(details.get("route", "")).split(">")
+            if hop.strip()
+        ][:8]
+        paths.append(
+            {
+                "id": component.removeprefix("path_"),
+                "name": str(details.get("name", component.removeprefix("path_"))),
+                "direction": str(details.get("direction", "observed")),
+                "route": route,
+                "status": "stale"
+                if stale
+                else str(details.get("status", effective_state)),
+                "evidence": str(details.get("evidence", "unavailable")),
+                "required": details.get("required") is True,
+                "stale": stale,
+                "message": str(item.get("message", "")),
+                "checked_at": item.get("observed_at"),
+            }
+        )
+    order = {
+        "cloudflare_xray": 0,
+        "xray_egress": 1,
+        "ssh": 2,
+        "stats_service": 3,
+        "private_dashboard": 4,
+    }
+    paths.sort(key=lambda item: order.get(str(item["id"]), 100))
+    return paths
+
+
+def _overall_health(
+    health: Mapping[str, Mapping[str, object]], *, now: float
+) -> str:
+    active: dict[str, str] = {}
+    for component, item in health.items():
+        state = str(item.get("state", "unknown"))
+        if state == "disabled":
+            continue
+        if component.startswith("path_"):
+            if not _is_required_verified_path(dict(item)):
+                continue
+            state, _stale = _required_path_effective_state(dict(item), now=now)
+        active[component] = state
+    if not active:
         return "unknown"
-    states = {str(item.get("state", "unknown")) for item in health.values()}
+    states = set(active.values())
     if "unavailable" in states:
         return "critical"
     if states & {"degraded", "disabled", "unknown"}:

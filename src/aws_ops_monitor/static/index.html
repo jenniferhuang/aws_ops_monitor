@@ -69,10 +69,11 @@
           <article class="metric-card">
             <div class="metric-heading">
               <span class="metric-icon allowance" aria-hidden="true">◎</span>
-              <span>Transfer allowance</span>
+              <span>AWS instance MTD transfer</span>
             </div>
-            <strong id="allowance" class="metric-value">Unavailable</strong>
-            <small id="allowance-note">Requires AWS read-only metrics permission</small>
+            <strong id="allowance" class="metric-value">Usage unavailable</strong>
+            <small id="allowance-note">Single-instance month-to-date NetworkIn + NetworkOut unavailable · nominal per-instance plan allocation unavailable</small>
+            <small id="allowance-scope">Not regional pooled billing utilization.</small>
           </article>
         </section>
 
@@ -131,6 +132,10 @@
                 <progress id="disk-bar" max="100" value="0">0%</progress>
               </div>
               <div class="resource">
+                <div><span>CPU utilization</span><strong id="cpu-label">—</strong></div>
+                <progress id="cpu-bar" max="100" value="0">0%</progress>
+              </div>
+              <div class="resource">
                 <div><span>Load (1m)</span><strong id="load-label">—</strong></div>
                 <progress id="load-bar" max="100" value="0">0%</progress>
               </div>
@@ -139,8 +144,47 @@
               <div><dt>Uptime</dt><dd id="uptime">—</dd></div>
               <div><dt>Xray</dt><dd id="xray-health">Unknown</dd></div>
               <div><dt>Restart count</dt><dd id="xray-restarts">—</dd></div>
+              <div><dt>NIC packets (24h)</dt><dd id="nic-packets">—</dd></div>
+              <div><dt>NIC errors/drops (24h)</dt><dd id="nic-faults">—</dd></div>
               <div><dt>Collector age</dt><dd id="collector-age">—</dd></div>
             </dl>
+          </section>
+        </div>
+
+        <div class="two-column operational-evidence">
+          <section class="panel" aria-labelledby="aws-title">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">CONTROL PLANE</p>
+                <h2 id="aws-title">AWS Lightsail evidence</h2>
+              </div>
+              <span id="aws-status" class="mini-badge">Unknown</span>
+            </div>
+            <dl class="facts aws-facts">
+              <div><dt>Instance</dt><dd id="aws-instance">—</dd></div>
+              <div><dt>Firewall</dt><dd id="aws-firewall">—</dd></div>
+              <div><dt>Alarms</dt><dd id="aws-alarms">—</dd></div>
+              <div><dt>AWS CPU</dt><dd id="aws-cpu">—</dd></div>
+              <div><dt>Burst capacity</dt><dd id="aws-burst">—</dd></div>
+              <div><dt>Month inbound</dt><dd id="aws-inbound">—</dd></div>
+              <div><dt>Month outbound</dt><dd id="aws-outbound">—</dd></div>
+              <div><dt>Evidence age</dt><dd id="aws-age">—</dd></div>
+            </dl>
+            <p id="aws-note" class="panel-footnote">AWS usage remains hidden unless current read-only health evidence validates it.</p>
+          </section>
+
+          <section class="panel" aria-labelledby="users-title">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">PRIVACY-SAFE</p>
+                <h2 id="users-title">Xray users</h2>
+              </div>
+              <span id="xray-user-count" class="count-badge">0</span>
+            </div>
+            <div id="xray-users" class="user-list">
+              <p class="empty-state">No per-user counter evidence is available.</p>
+            </div>
+            <p class="panel-footnote">Stable HMAC pseudonyms only; UUIDs and client addresses are never returned.</p>
           </section>
         </div>
 

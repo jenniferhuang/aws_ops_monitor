@@ -18,6 +18,9 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(config.host_enabled)
         self.assertFalse(config.xray_enabled)
         self.assertIsNone(config.xray_user_hash_key)
+        self.assertEqual(config.raw_retention_days, 7)
+        self.assertEqual(config.rollup_retention_days, 400)
+        self.assertEqual(config.retention_prune_interval_seconds, 3600.0)
 
     def test_enabling_xray_requires_hash_key(self) -> None:
         with self.assertRaisesRegex(ConfigError, "requires a private user hashing key"):
@@ -80,6 +83,52 @@ class ConfigTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ConfigError, "0600 or 0640"):
             Config.from_env({"AWS_OPS_DB_FILE_MODE": "0666"})
+
+    def test_retention_is_bounded_and_configurable(self) -> None:
+        config = Config.from_env(
+            {
+                "AWS_OPS_RAW_RETENTION_DAYS": "14",
+                "AWS_OPS_ROLLUP_RETENTION_DAYS": "500",
+                "AWS_OPS_RETENTION_INTERVAL_SECONDS": "7200",
+            }
+        )
+        self.assertEqual(config.raw_retention_days, 14)
+        self.assertEqual(config.rollup_retention_days, 500)
+        self.assertEqual(config.retention_prune_interval_seconds, 7200.0)
+        for value in ("0", "31", "not-a-number"):
+            with self.subTest(value=value), self.assertRaises(ConfigError):
+                Config.from_env({"AWS_OPS_RAW_RETENTION_DAYS": value})
+        for value in ("29", "801", "not-a-number"):
+            with self.subTest(value=value), self.assertRaises(ConfigError):
+                Config.from_env({"AWS_OPS_ROLLUP_RETENTION_DAYS": value})
+        with self.assertRaisesRegex(ConfigError, "between 300 and 86400"):
+            Config.from_env({"AWS_OPS_RETENTION_INTERVAL_SECONDS": "60"})
+
+    def test_probe_defaults_and_destination_validation(self) -> None:
+        config = Config.from_env({})
+        self.assertTrue(config.path_probes_enabled)
+        self.assertEqual(config.probe_public_hostname, "v2.hermes-node.com")
+        self.assertEqual(config.probe_public_path, "/302")
+        self.assertEqual(config.warp_proxy_server, "127.0.0.1:1087")
+        self.assertGreaterEqual(config.probe_minimum_interval_seconds, 300)
+        with self.assertRaisesRegex(ConfigError, "valid DNS hostname"):
+            Config.from_env({"AWS_OPS_PROBE_PUBLIC_HOST": "127.0.0.1"})
+        with self.assertRaisesRegex(ConfigError, "bounded absolute path"):
+            Config.from_env({"AWS_OPS_PROBE_PUBLIC_PATH": "/302\r\nHost: private"})
+        with self.assertRaisesRegex(ConfigError, "loopback"):
+            Config.from_env({"AWS_OPS_WARP_PROXY_SERVER": "0.0.0.0:1087"})
+        with self.assertRaisesRegex(ConfigError, "between 300 and 86400"):
+            Config.from_env({"AWS_OPS_PROBE_INTERVAL_SECONDS": "299"})
+
+    def test_udp_listener_policy_is_explicit(self) -> None:
+        config = Config.from_env(
+            {
+                "AWS_OPS_EXPECTED_PUBLIC_UDP_PORTS": "443,53",
+                "AWS_OPS_EXPECTED_LOOPBACK_UDP_PORTS": "5353",
+            }
+        )
+        self.assertEqual(config.expected_public_udp_ports, (53, 443))
+        self.assertEqual(config.expected_loopback_udp_ports, (5353,))
 
 
 if __name__ == "__main__":

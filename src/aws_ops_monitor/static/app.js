@@ -22,6 +22,9 @@ function pick(object, paths, fallback = null) {
 }
 
 function finiteNumber(value) {
+  if (value === null || value === undefined || typeof value === "boolean") return null;
+  if (typeof value !== "number" && typeof value !== "string") return null;
+  if (typeof value === "string" && value.trim() === "") return null;
   const number = typeof value === "number" ? value : Number(value);
   return Number.isFinite(number) ? number : null;
 }
@@ -180,41 +183,44 @@ function renderOverview(data) {
     byId("xray-note").textContent = `Up ${formatBytes(xrayUp)} · down ${formatBytes(xrayDown)} · separate layer`;
   }
 
-  renderAllowance(data);
+  renderInstanceTransfer(data);
   renderResources(data, collectedAt);
+  renderAWS(data);
+  renderXrayUsers(pick(data, ["traffic.xray.users"], []));
   renderPaths(pick(data, ["paths", "access_paths", "network.paths"], []));
   renderAlerts(pick(data, ["alerts", "health.alerts", "limits"], []));
 }
 
-function renderAllowance(data) {
-  const allowance = finiteNumber(pick(data, [
+function renderInstanceTransfer(data) {
+  const planAllocation = finiteNumber(pick(data, [
+    "traffic.aws.plan_allocation_bytes",
+    "aws.plan_allocation_bytes",
+    // Compatibility only for an older monitor projection.
     "traffic.aws.allowance_bytes",
-    "traffic.allowance_bytes",
     "aws.allowance_bytes",
-    "allowance_bytes",
   ]));
   const used = finiteNumber(pick(data, [
     "traffic.aws.transfer_used_bytes",
     "traffic.aws.used_bytes",
     "aws.transfer_used_bytes",
-    "allowance_used_bytes",
   ]));
-  const source = String(pick(data, ["traffic.aws.source", "aws.source", "allowance_source"], "unavailable"));
+  const source = String(pick(data, [
+    "traffic.aws.plan_allocation_source",
+    "aws.plan_allocation_source",
+    // Compatibility only for an older monitor projection.
+    "traffic.aws.allowance_source",
+    "aws.allowance_source",
+  ], "unavailable"));
   const value = byId("allowance");
   const note = byId("allowance-note");
-  if (allowance === null) {
-    value.textContent = "Unavailable";
-    note.textContent = "Requires AWS read-only metrics permission";
-    return;
-  }
-  if (used === null) {
-    value.textContent = formatBytes(allowance);
-    note.textContent = `Configured allowance · source: ${source}`;
-    return;
-  }
-  const percent = allowance > 0 ? Math.min(999, (used / allowance) * 100) : null;
-  value.textContent = percent === null ? formatBytes(used) : `${percent.toFixed(percent >= 10 ? 1 : 2)}%`;
-  note.textContent = `${formatBytes(used)} of ${formatBytes(allowance)} · source: ${source}`;
+  value.textContent = used === null ? "Usage unavailable" : formatBytes(used);
+  const usageLabel = used === null
+    ? "Single-instance month-to-date NetworkIn + NetworkOut unavailable"
+    : "Single-instance month-to-date NetworkIn + NetworkOut";
+  const planLabel = planAllocation === null
+    ? "nominal per-instance plan allocation unavailable"
+    : `nominal per-instance plan allocation ${formatBytes(planAllocation)} · source: ${source}`;
+  note.textContent = `${usageLabel} · ${planLabel}`;
 }
 
 function renderResources(data, collectedAt) {
@@ -228,6 +234,13 @@ function renderResources(data, collectedAt) {
   const diskPercent = pick(data, ["host.disk.percent", "resources.disk.percent", "disk_percent"]);
   setProgress("disk", diskUsed, diskTotal, diskPercent);
 
+  const cpuPercent = finiteNumber(pick(data, [
+    "host.cpu_utilization_percent",
+    "resources.cpu_utilization_percent",
+    "cpu_utilization_percent",
+  ]));
+  setProgress("cpu", null, null, cpuPercent);
+
   const load = finiteNumber(pick(data, ["host.load_1m", "resources.load_1m", "load_1m"]));
   const cpuCount = finiteNumber(pick(data, ["host.cpu_count", "resources.cpu_count", "cpu_count"]));
   const loadPercent = load === null || !cpuCount ? null : (load / cpuCount) * 100;
@@ -235,10 +248,97 @@ function renderResources(data, collectedAt) {
   byId("load-label").textContent = load === null ? "—" : load.toFixed(2);
 
   byId("uptime").textContent = formatDuration(pick(data, ["host.uptime_seconds", "resources.uptime_seconds", "uptime_seconds"]));
-  byId("xray-health").textContent = String(pick(data, ["services.xray.status", "xray.status", "xray_status"], "Unknown"));
+  const xrayStatus = String(pick(data, ["services.xray.status", "xray.status", "xray_status"], "Unknown"));
+  const containerStatus = pick(data, ["services.xray.container_status", "xray.container_status"]);
+  const oomKilled = pick(data, ["services.xray.oom_killed", "xray.oom_killed"], false);
+  byId("xray-health").textContent = `${xrayStatus}${containerStatus ? ` · ${containerStatus}` : ""}${oomKilled ? " · OOM" : ""}`;
   const restarts = finiteNumber(pick(data, ["services.xray.restart_count", "xray.restart_count", "xray_restarts"]));
   byId("xray-restarts").textContent = restarts === null ? "—" : String(restarts);
+  const rxPackets = finiteNumber(pick(data, ["traffic.host.rx_packets_window"]));
+  const txPackets = finiteNumber(pick(data, ["traffic.host.tx_packets_window"]));
+  byId("nic-packets").textContent = rxPackets === null && txPackets === null
+    ? "—"
+    : `↓ ${Math.round(rxPackets || 0).toLocaleString()} · ↑ ${Math.round(txPackets || 0).toLocaleString()}`;
+  const faultValues = ["rx_errors_window", "rx_drops_window", "tx_errors_window", "tx_drops_window"]
+    .map((field) => finiteNumber(pick(data, [`traffic.host.${field}`])))
+    .filter((value) => value !== null);
+  const faults = faultValues.reduce((sum, value) => sum + value, 0);
+  byId("nic-faults").textContent = faultValues.length ? String(Math.round(faults)) : "—";
   byId("collector-age").textContent = formatAge(collectedAt);
+}
+
+function evidenceText(value) {
+  if (value === null || value === undefined || value === "") return "—";
+  if (Array.isArray(value)) return value.slice(0, 12).map(String).join(", ") || "—";
+  return String(value);
+}
+
+function formatPercent(value) {
+  const number = finiteNumber(value);
+  return number === null ? "—" : `${number.toFixed(number >= 10 ? 1 : 2)}%`;
+}
+
+function renderAWS(data) {
+  const service = pick(data, ["services.aws", "aws"], {});
+  const status = String(pick(service, ["status", "state"], "unknown"));
+  const badge = byId("aws-status");
+  badge.textContent = status;
+  badge.className = `mini-badge status-${status.toLowerCase().replace(/[^a-z]/g, "")}`;
+  byId("aws-instance").textContent = evidenceText(pick(service, ["instance_state", "instance_status"]));
+  byId("aws-firewall").textContent = evidenceText(pick(service, ["firewall_open_ports", "open_ports"]));
+  byId("aws-alarms").textContent = evidenceText(pick(service, ["alarm_count", "active_alarm_count"]));
+  byId("aws-cpu").textContent = formatPercent(pick(service, [
+    "cpu_utilization_max_percent",
+    "cpu_utilization_percent",
+    "cpu_utilization",
+  ]));
+  const burstPercent = finiteNumber(pick(service, [
+    "burst_capacity_min_percent",
+    "burst_capacity_percent",
+  ]));
+  const burstMinutes = finiteNumber(pick(service, ["burst_capacity_time_minutes"]));
+  byId("aws-burst").textContent = burstPercent !== null
+    ? formatPercent(burstPercent)
+    : burstMinutes !== null ? `${burstMinutes.toFixed(0)} min` : "—";
+  byId("aws-inbound").textContent = formatBytes(pick(data, ["traffic.aws.network_in_month_bytes"]));
+  byId("aws-outbound").textContent = formatBytes(pick(data, ["traffic.aws.network_out_month_bytes"]));
+  byId("aws-age").textContent = formatAge(pick(service, ["checked_at", "observed_at"]));
+  const usageSource = pick(data, ["traffic.aws.usage_source"]);
+  const message = pick(service, ["message"]);
+  const riskFlags = pick(service, ["risk_flags", "missing_data"]);
+  const unsafeRules = finiteNumber(pick(service, ["unsafe_world_open_rule_count"]));
+  const statusFailures = finiteNumber(pick(service, ["status_check_failed_count"]));
+  const summary = usageSource
+    ? `${message || "Current AWS telemetry"} · usage source: ${usageSource}`
+    : `${message || "AWS evidence unavailable"} · month-to-date usage is hidden`;
+  const evidence = [];
+  if (riskFlags) evidence.push(`flags: ${evidenceText(riskFlags)}`);
+  if (unsafeRules !== null) evidence.push(`unsafe rules: ${unsafeRules}`);
+  if (statusFailures !== null) evidence.push(`failed status checks: ${statusFailures}`);
+  byId("aws-note").textContent = evidence.length ? `${summary} · ${evidence.join(" · ")}` : summary;
+}
+
+function renderXrayUsers(rawUsers) {
+  const container = byId("xray-users");
+  container.replaceChildren();
+  const users = Array.isArray(rawUsers)
+    ? rawUsers.filter((user) => user && typeof user === "object" && /^usr_[0-9a-f]{24}$/.test(String(user.user_hash || "")))
+    : [];
+  byId("xray-user-count").textContent = String(users.length);
+  if (!users.length) {
+    container.append(emptyMessage("No per-user counter evidence is available."));
+    return;
+  }
+  for (const user of users.slice(0, 100)) {
+    const row = document.createElement("div");
+    row.className = "user-item";
+    const identity = document.createElement("code");
+    identity.textContent = String(user.user_hash);
+    const totals = document.createElement("span");
+    totals.textContent = `↑ ${formatBytes(user.uplink_bytes)} · ↓ ${formatBytes(user.downlink_bytes)}`;
+    row.append(identity, totals);
+    container.append(row);
+  }
 }
 
 function renderPaths(rawPaths) {

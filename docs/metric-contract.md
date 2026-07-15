@@ -7,7 +7,7 @@ confidence, and reset identity to counters.
 | --- | --- | --- | --- |
 | Host | Linux interface counters | Whole-instance RX/TX, packets, errors, drops | Kernel boot ID + interface |
 | Xray | StatsService | Proxied per-user and inbound traffic | Xray uptime/start identity |
-| AWS optional | Lightsail API | Five-minute `NetworkIn`/`NetworkOut` sums | AWS resource + period |
+| AWS optional | Lightsail API | One instance's five-minute `NetworkIn`/`NetworkOut` sums, aggregated month to date | AWS resource + period |
 
 For a monotonic counter `C`:
 
@@ -21,9 +21,16 @@ For a monotonic counter `C`:
 The UI must label:
 
 - AWS metrics as `AWS verified` only when read from the correct account;
-- allowance as `operator configured` or `inferred` when it is not verified;
+- nominal per-instance plan allocation with its AWS or operator provenance;
 - NIC month totals as `host-measured estimate`;
 - Xray data as an overlapping attributed subset.
+
+The AWS transfer panel keeps single-instance month-to-date
+`NetworkIn + NetworkOut` separate from the nominal per-instance plan
+allocation. The UI must not divide these values, present a utilization
+percentage, infer a remaining allowance, or label either value as regional
+pooled billing utilization. Same-bundle transfer can be pooled across instances
+in a region, and the monitor does not expose whole-account billing data.
 
 Initial retention targets are bounded: short-interval raw samples for seven
 days, hourly rollups for thirteen months, and no raw traffic log retention.

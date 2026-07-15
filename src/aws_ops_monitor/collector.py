@@ -7,7 +7,10 @@ from threading import Event
 import time
 from typing import Callable
 
+from .collectors.aws_lightsail import LightsailCollector
 from .collectors.host import HostCollector
+from .collectors.network import NetworkCollector
+from .collectors.probes import PathProbeCollector
 from .collectors.xray import XrayCollector
 from .config import Config
 from .models import (
@@ -35,6 +38,9 @@ class Collector:
         *,
         host_collector: HostCollector | None = None,
         xray_collector: XrayCollector | None = None,
+        network_collector: NetworkCollector | None = None,
+        path_probe_collector: PathProbeCollector | None = None,
+        aws_collector: LightsailCollector | None = None,
         clock: Callable[[], float] = time.time,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -58,6 +64,53 @@ class Collector:
             )
         else:
             self._xray = None
+        if network_collector is not None:
+            self._network = network_collector
+        elif config.network_enabled:
+            self._network = NetworkCollector(
+                ss_binary=config.ss_binary,
+                expected_public_ports=config.expected_public_ports,
+                expected_loopback_ports=config.expected_loopback_ports,
+                expected_public_udp_ports=config.expected_public_udp_ports,
+                expected_loopback_udp_ports=config.expected_loopback_udp_ports,
+                timeout_seconds=config.network_command_timeout_seconds,
+                clock=clock,
+            )
+        else:
+            self._network = None
+        if path_probe_collector is not None:
+            self._path_probes = path_probe_collector
+        elif config.path_probes_enabled:
+            self._path_probes = PathProbeCollector(
+                public_hostname=config.probe_public_hostname,
+                public_path=config.probe_public_path,
+                warp_enabled=config.warp_probe_enabled,
+                warp_proxy_server=config.warp_proxy_server,
+                getent_binary=config.getent_binary,
+                timeout_seconds=config.probe_timeout_seconds,
+                minimum_interval_seconds=config.probe_minimum_interval_seconds,
+                clock=clock,
+                monotonic=monotonic,
+            )
+        else:
+            self._path_probes = None
+        if aws_collector is not None:
+            self._aws = aws_collector
+        elif config.aws_enabled:
+            self._aws = LightsailCollector(
+                region=config.aws_region,
+                instance_name=config.lightsail_instance_name,
+                request_timeout_seconds=config.aws_request_timeout_seconds,
+                minimum_interval_seconds=config.aws_minimum_interval_seconds,
+                expected_public_tcp_ports=config.expected_public_ports,
+                transfer_allowance_bytes=config.transfer_allowance_bytes,
+                transfer_allowance_provenance=config.transfer_allowance_provenance,
+                clock=clock,
+                monotonic=monotonic,
+            )
+        else:
+            self._aws = None
+        self._last_retention_attempt: float | None = None
 
     def collect_once(self) -> CollectionResult:
         gauges: list[GaugeObservation] = []
@@ -122,6 +175,195 @@ class Collector:
             health.append(xray_health)
             xray_state = xray_health.state
 
+        if self._network is not None:
+            try:
+                network = self._network.collect()
+            except Exception:
+                observed_at = self._clock()
+                network_health = HealthObservation(
+                    observed_at,
+                    "network_exposure",
+                    HealthState.UNAVAILABLE,
+                    "listener inventory failed",
+                )
+                health.append(network_health)
+                network_state = network_health.state
+            else:
+                health.extend(network.health)
+                network_state = network.health[0].state
+        else:
+            observed_at = self._clock()
+            network_health = HealthObservation(
+                observed_at,
+                "network_exposure",
+                HealthState.DISABLED,
+                "listener inventory disabled",
+            )
+            health.append(network_health)
+            network_state = network_health.state
+
+        if self._path_probes is not None:
+            try:
+                health.extend(self._path_probes.collect())
+            except Exception:
+                observed_at = self._clock()
+                for component, name, direction, route in (
+                    (
+                        "path_public_dns",
+                        "Public DNS",
+                        "outbound check",
+                        "Lightsail>DNS resolver>global address",
+                    ),
+                    (
+                        "path_cloudflare_xray",
+                        "Public Xray WebSocket",
+                        "inbound synthetic loop",
+                        "Lightsail>Cloudflare HTTPS>Xray WebSocket",
+                    ),
+                    (
+                        "path_xray_egress",
+                        "VPN application egress",
+                        "outbound synthetic",
+                        "Xray local proxy>WARP>Cloudflare trace",
+                    ),
+                ):
+                    health.append(
+                        HealthObservation(
+                            observed_at,
+                            component,
+                            HealthState.UNAVAILABLE,
+                            "synthetic path collector failed",
+                            {
+                                "name": name,
+                                "direction": direction,
+                                "route": route,
+                                "status": "failed",
+                                "evidence": "synthetic_probe",
+                                "required": True,
+                                "fresh_for_seconds": min(
+                                    172800,
+                                    max(
+                                        600,
+                                        round(
+                                            self.config.probe_minimum_interval_seconds * 2
+                                        ),
+                                    ),
+                                ),
+                                "reason": "collector_failed",
+                            },
+                        )
+                    )
+        else:
+            observed_at = self._clock()
+            for component, name in (
+                ("path_public_dns", "Public DNS"),
+                ("path_cloudflare_xray", "Public Xray WebSocket"),
+                ("path_xray_egress", "VPN application egress"),
+            ):
+                health.append(
+                    HealthObservation(
+                        observed_at,
+                        component,
+                        HealthState.DISABLED,
+                        "synthetic path probes disabled",
+                        {
+                            "name": name,
+                            "direction": "synthetic",
+                            "route": "Synthetic path verification",
+                            "status": "disabled",
+                            "evidence": "synthetic_probe",
+                            "required": False,
+                            "fresh_for_seconds": min(
+                                172800,
+                                max(
+                                    600,
+                                    round(self.config.probe_minimum_interval_seconds * 2),
+                                ),
+                            ),
+                        },
+                    )
+                )
+
+        if self._aws is not None:
+            try:
+                aws = self._aws.collect()
+            except Exception:
+                observed_at = self._clock()
+                aws_health = HealthObservation(
+                    observed_at,
+                    "aws",
+                    HealthState.UNAVAILABLE,
+                    "Lightsail read-only telemetry failed",
+                    {
+                        "fresh_for_seconds": min(
+                            172800,
+                            max(
+                                600,
+                                round(self.config.aws_minimum_interval_seconds * 2),
+                            ),
+                        ),
+                        "reason": "collector_failed",
+                    },
+                )
+                health.append(aws_health)
+                aws_state = aws_health.state
+            else:
+                gauges.extend(aws.gauges)
+                health.append(aws.health)
+                aws_state = aws.health.state
+        else:
+            observed_at = self._clock()
+            aws_health = HealthObservation(
+                observed_at,
+                "aws",
+                HealthState.DISABLED,
+                "Lightsail read-only telemetry disabled",
+            )
+            health.append(aws_health)
+            aws_state = aws_health.state
+
+        retention_now = self._monotonic()
+        if (
+            self._last_retention_attempt is None
+            or retention_now - self._last_retention_attempt
+            >= self.config.retention_prune_interval_seconds
+        ):
+            self._last_retention_attempt = retention_now
+            observed_at = self._clock()
+            try:
+                retention_counts = self.store.apply_retention(
+                    now=observed_at,
+                    raw_retention_days=self.config.raw_retention_days,
+                    rollup_retention_days=self.config.rollup_retention_days,
+                )
+            except Exception:
+                health.append(
+                    HealthObservation(
+                        observed_at,
+                        "retention",
+                        HealthState.UNAVAILABLE,
+                        "telemetry retention failed",
+                        {
+                            "raw_retention_days": self.config.raw_retention_days,
+                            "rollup_retention_days": self.config.rollup_retention_days,
+                        },
+                    )
+                )
+            else:
+                health.append(
+                    HealthObservation(
+                        observed_at,
+                        "retention",
+                        HealthState.HEALTHY,
+                        "telemetry retention applied",
+                        {
+                            "raw_retention_days": self.config.raw_retention_days,
+                            "rollup_retention_days": self.config.rollup_retention_days,
+                            **retention_counts,
+                        },
+                    )
+                )
+
         self.store.record_batch(gauges=gauges, counters=counters, health=health)
         result = CollectionResult(
             observed_at=self._clock(),
@@ -129,11 +371,15 @@ class Collector:
             xray_state=xray_state,
             gauge_count=len(gauges),
             counter_count=len(counters),
+            network_state=network_state,
+            aws_state=aws_state,
         )
         LOG.info(
-            "collection complete host=%s xray=%s gauges=%d counters=%d",
+            "collection complete host=%s xray=%s network=%s aws=%s gauges=%d counters=%d",
             result.host_state.value,
             result.xray_state.value,
+            result.network_state.value,
+            result.aws_state.value,
             result.gauge_count,
             result.counter_count,
         )

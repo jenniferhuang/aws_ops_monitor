@@ -49,6 +49,6 @@ An unauthenticated quick tunnel is not acceptable for this operations site.
 
 The optional control-plane adapter needs read operations such as
 `lightsail:GetInstance`, `lightsail:GetInstancePortStates`,
-`lightsail:GetInstanceMetricData`, and `lightsail:GetAlarmsForResource`.
+`lightsail:GetInstanceMetricData`, and `lightsail:GetAlarms`.
 Billing access is separate. The monitor does not need instance lifecycle,
 firewall mutation, key-pair, DNS mutation, or write permissions.

@@ -19,11 +19,8 @@ _TEXT_STAT = re.compile(
     r'name:\s*"(?P<name>(?:\\.|[^"\\])*)".*?value:\s*(?P<value>[0-9]+)',
     re.DOTALL,
 )
-_SAFE_TAG = re.compile(r"^[A-Za-z0-9_.:@-]{1,128}$")
-_UUID = re.compile(
-    r"(?i)(?:^|[^0-9a-f])"
-    r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
-    r"(?:$|[^0-9a-f])"
+_CONTAINER_STATES = frozenset(
+    {"created", "running", "paused", "restarting", "removing", "exited", "dead"}
 )
 
 
@@ -39,6 +36,15 @@ class CommandResult:
 
 
 CommandRunner = Callable[[Sequence[str], float], CommandResult]
+
+
+@dataclass(frozen=True, slots=True)
+class ContainerState:
+    inspect_ok: bool
+    reset_material: str = "inspect-unavailable"
+    status: str = "unknown"
+    restart_count: int | None = None
+    oom_killed: bool | None = None
 
 
 def _run_command(command: Sequence[str], timeout: float) -> CommandResult:
@@ -58,8 +64,9 @@ def _pseudonym(prefix: str, hash_key: bytes, raw: str) -> str:
 
 
 def _safe_tag(raw: str, hash_key: bytes) -> str:
-    if _SAFE_TAG.fullmatch(raw) and not _UUID.search(raw):
-        return raw
+    # Tags are operator-controlled text and can contain names, e-mail
+    # addresses, tenant identifiers, or other sensitive labels. Always hash
+    # them, even when the syntax itself looks harmless.
     return _pseudonym("tag", hash_key, raw)
 
 
@@ -94,8 +101,7 @@ def _text_items(payload: str) -> list[dict[str, object]]:
 def parse_xray_stats(payload: str, hash_key: bytes) -> tuple[XrayTrafficCounter, ...]:
     """Parse supported Xray counters without returning raw identities.
 
-    User labels are always HMAC pseudonyms. Inbound/outbound tags are retained
-    only when they match a conservative tag grammar and do not contain a UUID.
+    User labels and inbound/outbound tags are always HMAC pseudonyms.
     Unsupported stats are ignored rather than persisted as raw names.
     """
 
@@ -155,6 +161,36 @@ def _reset_identity(inspect_output: str) -> str:
     return f"xray-container:{digest[:24]}"
 
 
+def _parse_container_state(result: CommandResult) -> ContainerState:
+    if result.returncode != 0 or len(result.stdout.encode("utf-8")) > 4096:
+        return ContainerState(False)
+    fields = result.stdout.strip().split("|")
+    if len(fields) != 5:
+        return ContainerState(False)
+    container_id, started_at, status, raw_restarts, raw_oom = fields
+    if (
+        not container_id
+        or len(container_id) > 128
+        or not started_at
+        or len(started_at) > 128
+        or status not in _CONTAINER_STATES
+    ):
+        return ContainerState(False)
+    try:
+        restart_count = int(raw_restarts)
+    except ValueError:
+        return ContainerState(False)
+    if not 0 <= restart_count <= 2**31 - 1 or raw_oom.lower() not in {"true", "false"}:
+        return ContainerState(False)
+    return ContainerState(
+        True,
+        reset_material=f"{container_id}|{started_at}",
+        status=status,
+        restart_count=restart_count,
+        oom_killed=raw_oom.lower() == "true",
+    )
+
+
 class XrayCollector:
     """Collect Xray stats with fixed argv calls and no Docker socket mount."""
 
@@ -183,24 +219,22 @@ class XrayCollector:
 
     def collect(self) -> XraySnapshot:
         observed_at = self._clock()
-        inspect_ok = False
-        inspect_material = "inspect-unavailable"
+        container_state = ContainerState(False)
         try:
             inspect = self._runner(
                 (
                     self._docker_binary,
                     "inspect",
-                    "--format={{.Id}}|{{.State.StartedAt}}",
+                    "--format={{.Id}}|{{.State.StartedAt}}|{{.State.Status}}|"
+                    "{{.RestartCount}}|{{.State.OOMKilled}}",
                     self._container,
                 ),
                 self._timeout_seconds,
             )
-            if inspect.returncode == 0 and inspect.stdout.strip():
-                inspect_ok = True
-                inspect_material = inspect.stdout.strip()
+            container_state = _parse_container_state(inspect)
         except (OSError, subprocess.TimeoutExpired):
             pass
-        reset_id = _reset_identity(inspect_material)
+        reset_id = _reset_identity(container_state.reset_material)
 
         try:
             result = self._runner(
@@ -222,14 +256,14 @@ class XrayCollector:
                 observed_at,
                 reset_id,
                 "Xray stats command unavailable",
-                inspect_ok,
+                container_state,
             )
         if result.returncode != 0:
             return self._failure_snapshot(
                 observed_at,
                 reset_id,
                 "Xray stats command failed",
-                inspect_ok,
+                container_state,
                 command_exit=result.returncode,
             )
         try:
@@ -239,15 +273,24 @@ class XrayCollector:
                 observed_at,
                 reset_id,
                 "Xray stats response was invalid",
-                inspect_ok,
+                container_state,
             )
 
-        state = HealthState.HEALTHY if inspect_ok else HealthState.DEGRADED
-        message = (
-            "Xray counters collected"
-            if inspect_ok
-            else "Xray counters collected without container reset identity"
-        )
+        if not container_state.inspect_ok:
+            state = HealthState.DEGRADED
+            message = "Xray counters collected without container health evidence"
+        elif container_state.status != "running":
+            state = HealthState.UNAVAILABLE
+            message = "Xray container is not running"
+        elif container_state.oom_killed:
+            state = HealthState.DEGRADED
+            message = "Xray container reports an out-of-memory termination"
+        elif container_state.restart_count:
+            state = HealthState.DEGRADED
+            message = "Xray container has restarted since it was created"
+        else:
+            state = HealthState.HEALTHY
+            message = "Xray counters and container health collected"
         return XraySnapshot(
             observed_at=observed_at,
             reset_id=reset_id,
@@ -257,7 +300,13 @@ class XrayCollector:
                 component="xray",
                 state=state,
                 message=message,
-                details={"counter_count": len(counters), "inspect_ok": inspect_ok},
+                details={
+                    "counter_count": len(counters),
+                    "inspect_ok": container_state.inspect_ok,
+                    "container_status": container_state.status,
+                    "restart_count": container_state.restart_count,
+                    "oom_killed": container_state.oom_killed,
+                },
             ),
         )
     @staticmethod
@@ -265,12 +314,15 @@ class XrayCollector:
         observed_at: float,
         reset_id: str,
         message: str,
-        inspect_ok: bool,
+        container_state: ContainerState,
         command_exit: int | None = None,
     ) -> XraySnapshot:
         details: dict[str, str | int | bool | None] = {
             "counter_count": 0,
-            "inspect_ok": inspect_ok,
+            "inspect_ok": container_state.inspect_ok,
+            "container_status": container_state.status,
+            "restart_count": container_state.restart_count,
+            "oom_killed": container_state.oom_killed,
         }
         if command_exit is not None:
             details["command_exit"] = command_exit

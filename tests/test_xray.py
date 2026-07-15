@@ -16,7 +16,7 @@ HASH_KEY = b"test-only-private-hash-key"
 
 
 class XrayParserTests(unittest.TestCase):
-    def test_json_parser_hashes_users_and_preserves_safe_route_tags(self) -> None:
+    def test_json_parser_hashes_users_and_every_route_tag(self) -> None:
         email = "person@example.com"
         uuid = "123e4567-e89b-42d3-a456-426614174000"
         payload = json.dumps(
@@ -39,9 +39,35 @@ class XrayParserTests(unittest.TestCase):
         self.assertTrue(all(counter.identity_label == "user_hash" for counter in users))
         self.assertTrue(all(counter.identity_value.startswith("usr_") for counter in users))
         warp = next(counter for counter in counters if counter.scope == "outbound")
-        self.assertEqual(warp.identity_value, "WARP")
+        self.assertTrue(warp.identity_value.startswith("tag_"))
+        self.assertNotIn("WARP", warp.identity_value)
         inbound = next(counter for counter in counters if counter.scope == "inbound")
         self.assertTrue(inbound.identity_value.startswith("tag_"))
+
+    def test_route_tags_never_persist_email_uuid_v7_or_secret_text(self) -> None:
+        raw_tags = (
+            "jennifer@example.com",
+            "018f1f6c-5c6d-7a2b-8c9d-123456789abc",
+            "private-token-value",
+        )
+        counters = parse_xray_stats(
+            json.dumps(
+                {
+                    "stat": [
+                        {
+                            "name": f"outbound>>>{tag}>>>traffic>>>uplink",
+                            "value": index + 1,
+                        }
+                        for index, tag in enumerate(raw_tags)
+                    ]
+                }
+            ),
+            HASH_KEY,
+        )
+        serialized = repr(counters)
+        self.assertTrue(all(counter.identity_value.startswith("tag_") for counter in counters))
+        for raw_tag in raw_tags:
+            self.assertNotIn(raw_tag, serialized)
 
     def test_text_parser_and_empty_json(self) -> None:
         payload = """
@@ -73,7 +99,10 @@ class XrayCollectorTests(unittest.TestCase):
         def runner(command, _timeout):
             commands.append(tuple(command))
             if command[1] == "inspect":
-                return CommandResult(0, "raw-container-id|2026-07-15T00:00:00Z\n")
+                return CommandResult(
+                    0,
+                    "raw-container-id|2026-07-15T00:00:00Z|running|3|false\n",
+                )
             return CommandResult(
                 0,
                 '{"stat":[{"name":"user>>>person@example.com>>>traffic>>>uplink","value":"7"}]}',
@@ -84,11 +113,16 @@ class XrayCollectorTests(unittest.TestCase):
             runner=runner,
             clock=lambda: 55.0,
         ).collect()
-        self.assertEqual(snapshot.health.state, HealthState.HEALTHY)
+        self.assertEqual(snapshot.health.state, HealthState.DEGRADED)
         self.assertRegex(snapshot.reset_id, r"^xray-container:[0-9a-f]{24}$")
         self.assertNotIn("raw-container-id", snapshot.reset_id)
         self.assertNotIn("person@example.com", repr(snapshot))
+        self.assertEqual(snapshot.health.details["container_status"], "running")
+        self.assertEqual(snapshot.health.details["restart_count"], 3)
+        self.assertFalse(snapshot.health.details["oom_killed"])
         self.assertEqual(commands[0][0:2], ("docker", "inspect"))
+        self.assertIn("{{.RestartCount}}", commands[0][2])
+        self.assertIn("{{.State.OOMKilled}}", commands[0][2])
         self.assertEqual(
             commands[1],
             (
@@ -109,13 +143,34 @@ class XrayCollectorTests(unittest.TestCase):
 
         def runner(command, _timeout):
             if command[1] == "inspect":
-                return CommandResult(0, "container|start")
+                return CommandResult(0, "container|start|running|0|false")
             return CommandResult(9, "", f"failed for {raw_secret}")
 
         snapshot = XrayCollector(hash_key=HASH_KEY, runner=runner).collect()
         self.assertEqual(snapshot.health.state, HealthState.UNAVAILABLE)
         self.assertNotIn(raw_secret, repr(snapshot.health))
         self.assertEqual(snapshot.health.details["command_exit"], 9)
+
+    def test_oom_and_non_running_container_health_are_exposed_without_raw_state(self) -> None:
+        def runner(command, _timeout):
+            if command[1] == "inspect":
+                return CommandResult(0, "private-id|start|running|4|true")
+            return CommandResult(0, '{"stat":[]}')
+
+        snapshot = XrayCollector(hash_key=HASH_KEY, runner=runner).collect()
+        self.assertEqual(snapshot.health.state, HealthState.DEGRADED)
+        self.assertTrue(snapshot.health.details["oom_killed"])
+        self.assertEqual(snapshot.health.details["restart_count"], 4)
+        self.assertNotIn("private-id", repr(snapshot))
+
+        def stopped_runner(command, _timeout):
+            if command[1] == "inspect":
+                return CommandResult(0, "private-id|start|exited|0|false")
+            return CommandResult(0, '{"stat":[]}')
+
+        stopped = XrayCollector(hash_key=HASH_KEY, runner=stopped_runner).collect()
+        self.assertEqual(stopped.health.state, HealthState.UNAVAILABLE)
+        self.assertEqual(stopped.health.details["container_status"], "exited")
 
 
 if __name__ == "__main__":

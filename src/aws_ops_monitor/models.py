@@ -159,9 +159,39 @@ class XraySnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class ListenerObservation:
+    """A privacy-safe listening socket classification.
+
+    Only the transport, port and exposure class leave the collector. Raw bind
+    addresses and peer addresses are deliberately absent from this model.
+    """
+
+    transport: str
+    port: int
+    exposure: str
+
+    def __post_init__(self) -> None:
+        if self.transport not in {"tcp", "udp"}:
+            raise ValueError("listener transport must be tcp or udp")
+        if isinstance(self.port, bool) or not isinstance(self.port, int) or not 1 <= self.port <= 65535:
+            raise ValueError("listener port is out of range")
+        if self.exposure not in {"loopback", "link_local", "public"}:
+            raise ValueError("listener exposure must be loopback, link_local, or public")
+
+
+@dataclass(frozen=True, slots=True)
+class NetworkSnapshot:
+    observed_at: float
+    listeners: tuple[ListenerObservation, ...]
+    health: tuple[HealthObservation, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class CollectionResult:
     observed_at: float
     host_state: HealthState
     xray_state: HealthState
     gauge_count: int
     counter_count: int
+    network_state: HealthState = HealthState.DISABLED
+    aws_state: HealthState = HealthState.DISABLED
