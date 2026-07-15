@@ -119,7 +119,13 @@ def newest_sample() -> float:
     finally:
         connection.close()
 
+initial_deadline = time.monotonic() + 60
 before = newest_sample()
+while before <= 0 and time.monotonic() < initial_deadline:
+    # A new database is created before the first host/Xray/network/AWS probe
+    # transaction commits.  Give that bounded first cycle time to finish.
+    time.sleep(0.5)
+    before = newest_sample()
 if before <= 0:
     raise SystemExit("monitor database has no samples")
 if time.time() - before > 180:
@@ -197,5 +203,7 @@ if not loopback_monitor:
 PY
 
 [[ $(docker inspect --format '{{.State.Running}}' xray) == true ]]
+systemctl is-active --quiet aws-ops-monitor-collector.service
+systemctl is-active --quiet aws-ops-monitor-web.service
 
 echo "Verified AWS Ops Monitor revision $actual_revision."
